@@ -112,9 +112,11 @@ MAX_THREADS = 100
 PROXY_VALIDATE_TIMEOUT = 12
 # Low concurrency + per-request delay keeps Railway's abuse detection happy.
 # (40 workers hammering one site with 2k requests is what got the project banned.)
-PROXY_VALIDATE_WORKERS = int(os.environ.get("PROXY_VALIDATE_WORKERS", "5"))
-PROXY_VALIDATE_DELAY_MIN = float(os.environ.get("PROXY_VALIDATE_DELAY_MIN", "0.5"))
-PROXY_VALIDATE_DELAY_MAX = float(os.environ.get("PROXY_VALIDATE_DELAY_MAX", "2.0"))
+# Defaults below are tuned for ipify (neutral endpoint) so we can push harder
+# without tripping Railway's "unusual network activity" sensor.
+PROXY_VALIDATE_WORKERS = int(os.environ.get("PROXY_VALIDATE_WORKERS", "25"))
+PROXY_VALIDATE_DELAY_MIN = float(os.environ.get("PROXY_VALIDATE_DELAY_MIN", "0.0"))
+PROXY_VALIDATE_DELAY_MAX = float(os.environ.get("PROXY_VALIDATE_DELAY_MAX", "0.0"))
 STATUS_EDIT_MIN_INTERVAL = 2.5          # seconds between status-message edits
 REBTEL_HOME = "https://my.rebtel.com/"
 REBTEL_AUTH_URL = "https://userapi.rebtel.com/v2/users/number/{phone}/authentication"
@@ -379,8 +381,9 @@ proxy_manager = ProxyManager()
 
 def validate_proxy(proxy_url: str, label: str = "") -> bool:
     """Return True if the proxy can fetch PROXY_VALIDATE_URL (default: ipify)."""
-    # Gentle pacing so we don't trip Railway's "unusual network activity".
-    time.sleep(random.uniform(PROXY_VALIDATE_DELAY_MIN, PROXY_VALIDATE_DELAY_MAX))
+    # Optional pacing; skipped entirely when DELAY_MAX is 0 (the fast default).
+    if PROXY_VALIDATE_DELAY_MAX > 0:
+        time.sleep(random.uniform(PROXY_VALIDATE_DELAY_MIN, PROXY_VALIDATE_DELAY_MAX))
     try:
         browser = random.choice(BROWSER_IMPERSONATIONS)
         resp = cffi_requests.get(
