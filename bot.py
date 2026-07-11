@@ -11,17 +11,15 @@ Commands
                                                   edits a live status message, alerts each
                                                   hit immediately and uploads hits.txt at the end
 - /stop                                          -> stops the running /check for this chat
-- /setpr      (reply to a .txt file OR args)    -> REPLACES the proxy pool. Parses many formats,
-                                                  validates each proxy via plain HTTP against
-                                                  http://httpbin.org/ip (no TLS, no fingerprinting)
-                                                  and adds it to the pool AS SOON AS it passes
-                                                  (streaming). If nothing works, the old pool is
-                                                  kept. Pool persists to disk.  Append "raw" to
-                                                  skip validation entirely: /setpr raw
-                                                  (recommended on Railway to avoid "unusual
-                                                  network activity" bans).
-- /addpr      (reply to a .txt file OR args)    -> ADDS working proxies to the pool (streaming,
-                                                  with persistence). /addpr raw also supported.
+- /setpr      (reply to a .txt file OR args)    -> REPLACES the proxy pool. DEFAULT: raw mode --
+                                                  parses proxies and adds them with ZERO outbound
+                                                  requests. This is the only mode that won't trip
+                                                  Railway's "suspicious network activity" ban when
+                                                  adding thousands of proxies. Dead ones drop out
+                                                  during /check. Use `/setpr validate` to
+                                                  pre-validate a *small* batch (<= VALIDATE_MAX_BATCH).
+- /addpr      (reply to a .txt file OR args)    -> ADDS proxies to the pool (default raw). Use
+                                                  `/addpr validate` for small-batch validation.
 - /clearpr                                       -> empties the proxy pool (and clears the file)
 - /listpr                                        -> shows how many proxies are in the pool
 - /start  /help                                  -> help text
@@ -138,6 +136,13 @@ PROXY_VALIDATE_WORKERS = int(os.environ.get("PROXY_VALIDATE_WORKERS", "2000"))
 # Only used as a brake if you ever need to slow things down via env.
 PROXY_VALIDATE_DELAY_MIN = float(os.environ.get("PROXY_VALIDATE_DELAY_MIN", "0.0"))
 PROXY_VALIDATE_DELAY_MAX = float(os.environ.get("PROXY_VALIDATE_DELAY_MAX", "0.0"))
+
+# Hard cap on the size of a batch that `/setpr validate` will actually go
+# through. Anything above this is auto-fallback to raw mode. Batch-validating
+# thousands of proxies from one Railway container triggers the platform's
+# "suspicious network activity" ban regardless of HTTP/HTTPS, Python/Go, or
+# fingerprinting -- it's a *connection-pattern* ban, not a content ban.
+VALIDATE_MAX_BATCH = int(os.environ.get("VALIDATE_MAX_BATCH", "100"))
 STATUS_EDIT_MIN_INTERVAL = 2.5          # seconds between status-message edits
 REBTEL_HOME = "https://my.rebtel.com/"
 REBTEL_AUTH_HEADER = "application 7443a5f6-01a7-4ce7-8e87-c36212fad4f5"
@@ -729,16 +734,20 @@ HELP_TEXT = (
     "every hit is sent to this chat immediately. When finished, `hits.txt` is uploaded.\n"
     "Use `/stop` to cancel the running check for this chat.\n\n"
     "*Proxies (shared pool, persisted to disk)*\n"
-    "/setpr - reply to a .txt file OR pass proxies as args. Validates each proxy "
-    "(default endpoint: http://httpbin.org/ip plain HTTP) and REPLACES the pool, streaming working proxies in "
-    "*as they pass*. If nothing works, the old pool is restored.\n"
-    "Append `raw` to skip validation entirely: `/setpr raw` (recommended on Railway "
-    "to avoid \"unusual network activity\" bans).\n"
-    "/addpr - same, but ADDS working proxies to the pool instead of replacing it. "
-    "`/addpr raw` also supported.\n"
-    "/check - re-verifies the pool before checking (disable with env "
-    "SKIP_POOL_REVERIFY=1, which is the default). Dead proxies drop out naturally "
-    "during the check via retries.\n"
+    "/setpr - reply to a .txt file OR pass proxies as args. By default this adds "
+    "proxies RAW (no validation) -- this is the only mode that won't trip "
+    "Railway's \"suspicious network activity\" ban when adding thousands of "
+    "proxies. Dead ones drop out during /check via retries.\n"
+    "To pre-validate a *small* list (<= the VALIDATE_MAX_BATCH cap), use "
+    "`/setpr validate`. Validation fans out one connection per proxy IP; "
+    "thousands of those from one Railway container looks like port-scanning "
+    "and gets the workspace banned, regardless of HTTP/HTTPS, Python/Go, or "
+    "fingerprinting -- the ban is on the *connection pattern*, not the "
+    "language. So for big lists, always use raw mode.\n"
+    "/addpr - same, but ADDS to the pool instead of replacing it. "
+    "`/addpr validate` also supported.\n"
+    "/check - uses the pool as-is. By default the pre-check batch re-verify is "
+    "disabled (SKIP_POOL_REVERIFY=1) so it doesn't re-trigger the same ban.\n"
     "/clearpr - empty the pool (and clears the saved file).\n"
     "/listpr - show pool size.\n\n"
     "Accepted proxy formats (one per line):\n"
@@ -817,13 +826,20 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 #  /setpr  /addpr
 # --------------------------------------------------------------------------- #
 async def _collect_proxy_candidates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[List[str], Optional[str], bool]:
-    """Return (candidates, scheme_hint, raw_flag).  raw=True when the user
-    passed 'raw' as the first arg (e.g. /setpr raw) -> skip validation."""
+    """Return (candidates, scheme_hint, validate_flag).  validate=True only
+    when the user explicitly passes 'validate' as the first arg.
+
+    Default (no flag): raw mode -- proxies are parsed and added with ZERO
+    outbound requests. This is the only mode that doesn't trip Railway's
+    'suspicious network activity' detector when adding thousands of proxies.
+    See /setpr help text for why.
+    """
     msg = update.message
-    raw = False
+    validate = False
     args = list(context.args or [])
-    if args and args[0].lower() == "raw":
-        raw = True
+    if args and args[0].lower() in ("validate", "raw"):
+        if args[0].lower() == "validate":
+            validate = True
         args = args[1:]
 
     # Case 1: reply to a file.
@@ -832,15 +848,15 @@ async def _collect_proxy_candidates(update: Update, context: ContextTypes.DEFAUL
         if data is not None:
             text = data.decode("utf-8", errors="ignore")
             hint = scheme_from_filename(filename)
-            return parse_proxy_text(text, hint), None, raw
+            return parse_proxy_text(text, hint), None, validate
     # Case 2: args on the command line (could be multi-line).
     if args:
         blob = "\n".join(args)
-        return parse_proxy_text(blob, "http"), None, raw
+        return parse_proxy_text(blob, "http"), None, validate
     # Case 3: if the replied message had text proxies.
     if msg.reply_to_message is not None and msg.reply_to_message.text:
-        return parse_proxy_text(msg.reply_to_message.text, "http"), None, raw
-    return [], None, raw
+        return parse_proxy_text(msg.reply_to_message.text, "http"), None, validate
+    return [], None, validate
 
 
 async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: bool) -> None:
@@ -848,14 +864,14 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
     cmd_name = "/addpr" if add else "/setpr"
     clog(f"[cmd] {cmd_name} from chat={msg.chat_id} user={update.effective_user}")
     status = await msg.reply_text("Collecting candidate proxies...")
-    candidates, _, raw = await _collect_proxy_candidates(update, context)
+    candidates, _, validate = await _collect_proxy_candidates(update, context)
     if not candidates:
         await status.edit_text(
             "No proxy candidates found.\n"
             "Reply `/setpr` to a `.txt` file of proxies (any format), "
             "or pass them as args, e.g.:\n"
             "`/setpr p101.squidproxies.com:9014:1316:p8zishJyoWbr`\n\n"
-            "Add `raw` to skip validation: `/setpr raw` (recommended on Railway).",
+            "Default is raw (no validation). Use `/setpr validate` for small batches.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -868,21 +884,55 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
             uniq.append(c)
     candidates = uniq
 
-    if raw:
-        # ---- raw mode: parse and add to the pool without any validation ----
+    # DEFAULT: raw mode (no validation). Validation that fan-outs thousands of
+    # outbound TCP connections to thousands of distinct proxy IPs from one
+    # Railway container is *exactly* the pattern Railway's "suspicious network
+    # activity" detector is built to ban -- regardless of HTTP vs HTTPS, Python
+    # vs Go, fingerprinting or not. So we ship raw-add as the safe default.
+    if not validate:
         if not add:
             proxy_manager.clear()
         added = proxy_manager.add(candidates)
         final_pool = proxy_manager.count()
         clog(f"[setpr] raw mode: parsed {len(candidates)} -> added {added}, pool now {final_pool}")
         await status.edit_text(
-            f"*Raw mode* (no validation).\n"
-            f"Parsed: {len(candidates)}  Added: {added} (dupes skipped)\n"
-            f"Pool size now: {final_pool}",
+            f"*Added {added} proxies (raw, no validation).*\n"
+            f"Parsed: {len(candidates)}  Dupes skipped: {len(candidates) - added}\n"
+            f"Pool size now: {final_pool}\n\n"
+            f"Dead proxies will be dropped naturally during /check via the "
+            f"existing retry logic. If you really want to pre-validate a "
+            f"_small_ list (<= {VALIDATE_MAX_BATCH}), use `/setpr validate`.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
+    # ---- explicit 'validate' mode ----
+    # Hard cap: validating more than VALIDATE_MAX_BATCH proxies in one shot
+    # re-triggers the very abuse pattern that got this workspace banned. We
+    # refuse and guide the user back to raw mode.
+    if len(candidates) > VALIDATE_MAX_BATCH:
+        clog(
+            f"{Colors.YELLOW}[setpr] validate refused: {len(candidates)} > "
+            f"cap {VALIDATE_MAX_BATCH} (would trip Railway ban){Colors.RESET}"
+        )
+        if not add:
+            proxy_manager.clear()
+        added = proxy_manager.add(candidates)
+        final_pool = proxy_manager.count()
+        await status.edit_text(
+            f"*Validation refused* -- batch too large ({len(candidates)} > {VALIDATE_MAX_BATCH}).\n"
+            f"Batch-validating thousands of proxies fans out thousands of "
+            f"outbound TCP connections to distinct IPs from one Railway "
+            f"container -- the exact pattern its abuse detector bans. The Go "
+            f"reference would be banned too at this scale.\n\n"
+            f"Falling back to raw mode. Added {added} proxies.\n"
+            f"Pool size now: {final_pool}\n\n"
+            f"Run `/check` next -- dead proxies drop out during the check via retries.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Small batch -- proceed with validation.
     # For /setpr (replace mode), remember the old pool so we can restore it if
     # nothing works. We wipe the pool *before* validation begins so that we can
     # stream wins in immediately; if nothing passes, we restore the old pool.
