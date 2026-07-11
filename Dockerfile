@@ -17,11 +17,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Application code.
 COPY bot.py .
 
-# bot.py writes hits_*.txt and proxy_pool.txt to /app at runtime.
-# To persist the proxy pool across Railway redeployments, mount a Railway
-# Volume at /app/data and set PROXY_POOL_DIR -- uncomment the ENV line below
-# if you do that.
-# ENV PROXY_POOL_DIR=/app/data
+# bot.py writes proxy_pool.txt to PROXY_POOL_DIR at runtime.
+# If you mount a Railway Volume at /app/data, proxy_pool.txt lives there
+# and survives restarts. This ENV is already set to enable that.
+ENV PROXY_POOL_DIR=/app/data
 
 # IMPORTANT: keep this on plain HTTP (http://...). HTTPS validation reloads
 # the libcurl TLS path that tripped Railway's abuse detector.
