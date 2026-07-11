@@ -16,8 +16,8 @@ Commands
                                                   requests. This is the only mode that won't trip
                                                   Railway's "suspicious network activity" ban when
                                                   adding thousands of proxies. Dead ones drop out
-                                                  during /check. Use `/setpr validate` to
-                                                  pre-validate a *small* batch (<= VALIDATE_MAX_BATCH).
+                                                   during /check. Use `/setpr validate` to
+                                                   pre-validate any batch (serial, one-at-a-time).
 - /addpr      (reply to a .txt file OR args)    -> ADDS proxies to the pool (default raw). Use
                                                   `/addpr validate` for small-batch validation.
 - /clearpr                                       -> empties the proxy pool (and clears the file)
@@ -143,7 +143,7 @@ PROXY_VALIDATE_DELAY_MAX = float(os.environ.get("PROXY_VALIDATE_DELAY_MAX", "0.0
 # thousands of proxies from one Railway container triggers the platform's
 # "suspicious network activity" ban regardless of HTTP/HTTPS, Python/Go, or
 # fingerprinting -- it's a *connection-pattern* ban, not a content ban.
-VALIDATE_MAX_BATCH = int(os.environ.get("VALIDATE_MAX_BATCH", "100"))
+
 STATUS_EDIT_MIN_INTERVAL = 2.5          # seconds between status-message edits
 REBTEL_HOME = "https://my.rebtel.com/"
 REBTEL_AUTH_HEADER = "application 7443a5f6-01a7-4ce7-8e87-c36212fad4f5"
@@ -222,7 +222,6 @@ SOCKS_PORTS = frozenset({
 # If "1", /check will NOT batch-reverify the whole pool before running. Dead
 # proxies then get filtered naturally during the check (retries + error drops).
 # Batch-reverifying a 2k pool from Railway triggers "unusual network activity".
-SKIP_POOL_REVERIFY = os.environ.get("SKIP_POOL_REVERIFY", "1") == "1"
 
 # Persistent shared proxy pool. One proxy URL per line. Survives restarts.
 # On Railway (or any container host) you can mount a Volume at /app/data and
@@ -842,16 +841,13 @@ HELP_TEXT = (
     "proxies RAW (no validation) -- this is the only mode that won't trip "
     "Railway's \"suspicious network activity\" ban when adding thousands of "
     "proxies. Dead ones drop out during /check via retries.\n"
-    "To pre-validate a *small* list (<= the VALIDATE_MAX_BATCH cap), use "
-    "`/setpr validate`. Validation fans out one connection per proxy IP; "
-    "thousands of those from one Railway container looks like port-scanning "
-    "and gets the workspace banned, regardless of HTTP/HTTPS, Python/Go, or "
-    "fingerprinting -- the ban is on the *connection pattern*, not the "
-    "language. So for big lists, always use raw mode.\n"
+    "To pre-validate (any size, serial one-at-a-time mode), use "
+    "`/setpr validate` — safe at any batch size because each proxy is "
+    "checked individually with seconds-long pauses; never more than one "
+    "in-flight connection.\n"
     "/addpr - same, but ADDS to the pool instead of replacing it. "
     "`/addpr validate` also supported.\n"
-    "/check - uses the pool as-is. By default the pre-check batch re-verify is "
-    "disabled (SKIP_POOL_REVERIFY=1) so it doesn't re-trigger the same ban.\n"
+    "/check - re-verifies the pool serially before checking accounts.\n"
     "/clearpr - empty the pool (and clears the saved file).\n"
     "/listpr - show pool size.\n\n"
     "Accepted proxy formats (one per line):\n"
@@ -1004,39 +1000,15 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
             f"Parsed: {len(candidates)}  Dupes skipped: {len(candidates) - added}\n"
             f"Pool size now: {final_pool}\n\n"
             f"Dead proxies will be dropped naturally during /check via the "
-            f"existing retry logic. If you really want to pre-validate a "
-            f"_small_ list (<= {VALIDATE_MAX_BATCH}), use `/setpr validate`.",
+            f"existing retry logic. If you want to pre-validate first, "
+            f"use `/setpr validate` (serial, any batch size).",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     # ---- explicit 'validate' mode ----
-    # Hard cap: validating more than VALIDATE_MAX_BATCH proxies in one shot
-    # re-triggers the very abuse pattern that got this workspace banned. We
-    # refuse and guide the user back to raw mode.
-    if len(candidates) > VALIDATE_MAX_BATCH:
-        clog(
-            f"{Colors.YELLOW}[setpr] validate refused: {len(candidates)} > "
-            f"cap {VALIDATE_MAX_BATCH} (would trip Railway ban){Colors.RESET}"
-        )
-        if not add:
-            proxy_manager.clear()
-        added = proxy_manager.add(candidates)
-        final_pool = proxy_manager.count()
-        await status.edit_text(
-            f"*Validation refused* -- batch too large ({len(candidates)} > {VALIDATE_MAX_BATCH}).\n"
-            f"Batch-validating thousands of proxies fans out thousands of "
-            f"outbound TCP connections to distinct IPs from one Railway "
-            f"container -- the exact pattern its abuse detector bans. The Go "
-            f"reference would be banned too at this scale.\n\n"
-            f"Falling back to raw mode. Added {added} proxies.\n"
-            f"Pool size now: {final_pool}\n\n"
-            f"Run `/check` next -- dead proxies drop out during the check via retries.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    # Small batch -- proceed with validation.
+    # Serial validation (one at a time, 3-6s delay) is safe at any batch size
+    # because there is never more than one in-flight TCP connection. No cap.
     # For /setpr (replace mode), remember the old pool so we can restore it if
     # nothing works. We wipe the pool *before* validation begins so that we can
     # stream wins in immediately; if nothing passes, we restore the old pool.
@@ -1472,9 +1444,9 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     threads = max(1, min(threads, MAX_THREADS))
 
     pool_n = proxy_manager.count()
-    if pool_n > 0 and not SKIP_POOL_REVERIFY:
+    if pool_n > 0:
         status_msg = await msg.reply_text(
-            f"Re-verifying {pool_n} proxies from the pool before checking...",
+            f"Re-verifying {pool_n} proxies serially (one at a time, safe)...",
             parse_mode=ParseMode.MARKDOWN,
         )
         rv_state = {"done": 0, "working": 0, "last_t": 0.0}
@@ -1489,21 +1461,30 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     context,
                     chat_id,
                     status_msg.message_id,
-                    f"Re-verifying pool ... `{working}` alive / `{done}`/`{total}` checked",
+                    f"Pool re-verify ... `{working}` working / `{done}`/`{total}` checked\n"
+                    f"(use /stop to cancel and keep what's verified so far)",
                 ))
 
         current_pool = proxy_manager.get_all()
-        working_after = await validate_proxies_async(
-            current_pool, progress_cb=rv_progress,
-        )
+        cancel_event = asyncio.Event()
+        active_validations[chat_id] = cancel_event
+        try:
+            working_after = await validate_proxies_serial(
+                current_pool, progress_cb=rv_progress,
+                cancel_event=cancel_event,
+            )
+        finally:
+            active_validations.pop(chat_id, None)
+
         working_set = set(working_after)
         dead = [p for p in current_pool if p not in working_set]
         for d in dead:
             proxy_manager.remove(d)
 
         pool_n = proxy_manager.count()
+        verb = "Stopped early." if cancel_event.is_set() else "Done."
         await status_msg.edit_text(
-            f"Pool re-verified. Working: {pool_n}  Dead removed: {len(dead)}.",
+            f"{verb} Working: {pool_n}  Dead removed: {len(dead)}.",
             parse_mode=ParseMode.MARKDOWN,
         )
         if pool_n == 0:
@@ -1511,11 +1492,6 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "No working proxies left in the pool after re-verification.\n"
                 "Add proxies with /setpr or /addpr, or run without a pool."
             )
-    elif pool_n > 0 and SKIP_POOL_REVERIFY:
-        await msg.reply_text(
-            f"Using {pool_n} proxies from the pool (re-verify skipped). "
-            f"Dead ones will drop out naturally during the check."
-        )
 
     mode = f"Proxy ({pool_n} in pool)" if pool_n else "Proxyless"
     status_msg = await msg.reply_text(
