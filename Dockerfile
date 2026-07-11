@@ -19,9 +19,17 @@ COPY bot.py .
 
 # bot.py writes hits_*.txt and proxy_pool.txt to /app at runtime.
 # To persist the proxy pool across Railway redeployments, mount a Railway
-# Volume at /app/data and set PROXY_POOL_DIR (see bot.py) -- uncomment the
-# ENV line below if you do that.
+# Volume at /app/data and set PROXY_POOL_DIR -- uncomment the ENV line below
+# if you do that.
 # ENV PROXY_POOL_DIR=/app/data
+
+# Anti-ban settings for Railway: the bot was banned for "unusual network
+# activity" after hammering my.rebtel.com 2k times during proxy validation.
+# These defaults keep network usage gentle. You can override them in Railway.
+ENV SKIP_POOL_REVERIFY=1
+ENV PROXY_VALIDATE_WORKERS=5
+ENV PROXY_VALIDATE_DELAY_MIN=0.5
+ENV PROXY_VALIDATE_DELAY_MAX=2.0
 
 # Unbuffered stdout so logs appear in Railway's console in real time.
 ENV PYTHONUNBUFFERED=1
