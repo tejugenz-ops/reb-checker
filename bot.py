@@ -110,7 +110,7 @@ def clog(*args, **kwargs):
 BOT_TOKEN = "7993577146:AAGktkZBUSh9BfJD0-3-nu31u-osaebM8zM"
 DEFAULT_THREADS = 10
 MAX_THREADS = 100
-PROXY_VALIDATE_TIMEOUT = 12
+PROXY_VALIDATE_TIMEOUT = 10          # matches Go reference (testProxy uses 10s)
 # Low concurrency + per-request delay keeps Railway's abuse detection happy.
 # (40 workers hammering one site with 2k requests is what got the project banned.)
 # Defaults below are tuned for ipify (neutral endpoint) so we can push harder
@@ -126,10 +126,14 @@ PROXY_VALIDATE_TIMEOUT = 12
 # Do NOT add an "s" (https://) here unless you also remove the Railway ban risk.
 PROXY_VALIDATE_URL = os.environ.get("PROXY_VALIDATE_URL", "http://httpbin.org/ip")
 
-# Number of concurrent validation workers. The Go reference launches one
-# goroutine per proxy (no cap); a Python worker pool of 50 strikes a good
-# balance between speed and not saturating the bot's event loop.
-PROXY_VALIDATE_WORKERS = int(os.environ.get("PROXY_VALIDATE_WORKERS", "50"))
+# Concurrency cap for the async proxy validator. The Go reference (reduce.go)
+# launches one goroutine per proxy with no cap; here we run one asyncio task
+# per proxy through curl_cffi's AsyncSession. A 2000-cap semaphore keeps us
+# from blowing out outbound socket limits on small Railway containers while
+# still processing 6918 proxies ~15s. Previous sync ThreadPoolExecutor at 50
+# workers stalled after ~25 proxies because dead ones held a thread for the
+# full 12s timeout -> ~4/s throughput looking "stuck".
+PROXY_VALIDATE_WORKERS = int(os.environ.get("PROXY_VALIDATE_WORKERS", "2000"))
 # Per-proxy delay (seconds). 0 = no delay, matches Go behaviour.
 # Only used as a brake if you ever need to slow things down via env.
 PROXY_VALIDATE_DELAY_MIN = float(os.environ.get("PROXY_VALIDATE_DELAY_MIN", "0.0"))
@@ -529,9 +533,78 @@ def validate_proxies(
     return working
 
 
-# --------------------------------------------------------------------------- #
-#  Rebtel authentication checker (ported from rebtel.py, sync/threaded)
-# --------------------------------------------------------------------------- #
+async def validate_proxies_async(
+    proxies: List[str],
+    progress_cb=None,
+    on_success=None,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> List[str]:
+    """Async proxy validator mirroring the Go reference's fan-out:
+
+    - One asyncio task per proxy (like goroutines) running through a single
+      ``curl_cffi`` AsyncSession -- the underlying curl multi handle handles
+      the actual socket multiplexing, so thousands of in-flight checks cost
+      no OS threads.
+    - Plain HTTP to PROXY_VALIDATE_URL, no TLS, no fingerprinting -- same
+      low profile as reduce.go's testProxy.
+    - 10s per-proxy timeout (matches Go); failed/dead ones return fast or
+      time out, never blocking the rest.
+    - Streams working proxies into the pool via on_success the moment each
+      completes.
+
+    This replaces the old 50-worker ThreadPoolExecutor which stalled because
+    dead proxies held a worker for the full timeout.
+    """
+    if not proxies:
+        return []
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:                                  # pragma: no cover
+        from curl_cffi import AsyncSession               # type: ignore
+    total = len(proxies)
+    state = {"completed": 0, "working": 0}
+    working: List[str] = []
+    w_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(max(1, PROXY_VALIDATE_WORKERS))
+
+    async def check(s, p: str) -> None:
+        async with sem:
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            if PROXY_VALIDATE_DELAY_MAX > 0:
+                await asyncio.sleep(random.uniform(PROXY_VALIDATE_DELAY_MIN, PROXY_VALIDATE_DELAY_MAX))
+            try:
+                r = await s.get(
+                    PROXY_VALIDATE_URL,
+                    proxy=p,
+                    timeout=PROXY_VALIDATE_TIMEOUT,
+                )
+                ok = r.status_code == 200 and bool(r.text and r.text.strip())
+            except Exception:
+                ok = False
+            async with w_lock:
+                state["completed"] += 1
+                if ok:
+                    state["working"] += 1
+                    working.append(p)
+                    if on_success is not None:
+                        try:
+                            on_success(p)
+                        except Exception:
+                            pass
+                if progress_cb is not None:
+                    try:
+                        progress_cb(state["completed"], total, state["working"])
+                    except Exception:
+                        pass
+
+    clog(f"{Colors.CYAN}[PROXY] validating {total} proxies async "
+         f"(concurrency={PROXY_VALIDATE_WORKERS}, timeout={PROXY_VALIDATE_TIMEOUT}s){Colors.RESET}")
+    async with AsyncSession() as session:
+        await asyncio.gather(*(check(session, p) for p in proxies), return_exceptions=True)
+    clog(f"{Colors.CYAN}[PROXY] validated {total} proxies, "
+         f"{state['working']} working{Colors.RESET}")
+    return working
 HITS_FILENAME = "hits_{chat_id}.txt"
 
 
@@ -844,10 +917,9 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
                 f"Pool size now: {proxy_manager.count()}",
             ))
 
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: validate_proxies(candidates, progress_cb=progress, on_success=on_success),
+    # Run async validation fan-out directly (matches Go's per-goroutine model).
+    await validate_proxies_async(
+        candidates, progress_cb=progress, on_success=on_success,
     )
 
     done = state["done"]
@@ -1251,11 +1323,9 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"Re-verifying pool ... `{working}` alive / `{done}`/`{total}` checked",
                 ))
 
-        loop = asyncio.get_running_loop()
         current_pool = proxy_manager.get_all()
-        working_after = await loop.run_in_executor(
-            None,
-            lambda: validate_proxies(current_pool, progress_cb=rv_progress),
+        working_after = await validate_proxies_async(
+            current_pool, progress_cb=rv_progress,
         )
         working_set = set(working_after)
         dead = [p for p in current_pool if p not in working_set]
