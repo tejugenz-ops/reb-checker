@@ -27,9 +27,9 @@ COPY bot.py .
 # activity" after hammering my.rebtel.com 2k times during proxy validation.
 # These defaults keep network usage gentle. You can override them in Railway.
 ENV SKIP_POOL_REVERIFY=1
-ENV PROXY_VALIDATE_WORKERS=5
-ENV PROXY_VALIDATE_DELAY_MIN=0.5
-ENV PROXY_VALIDATE_DELAY_MAX=2.0
+ENV PROXY_VALIDATE_WORKERS=25
+ENV PROXY_VALIDATE_DELAY_MIN=0.0
+ENV PROXY_VALIDATE_DELAY_MAX=0.0
 
 # Unbuffered stdout so logs appear in Railway's console in real time.
 ENV PYTHONUNBUFFERED=1
