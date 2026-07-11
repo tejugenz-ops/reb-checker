@@ -642,6 +642,75 @@ async def validate_proxies_async(
     clog(f"{Colors.CYAN}[PROXY] validated {total} proxies, "
          f"{state['working']} working{Colors.RESET}")
     return working
+
+
+async def validate_proxies_serial(
+    proxies: List[str],
+    progress_cb=None,
+    on_success=None,
+    cancel_event: Optional[asyncio.Event] = None,
+    delay_range: Tuple[float, float] = (3.0, 6.0),
+) -> List[str]:
+    """Ultra-safe proxy validator: one at a time with multi-second pauses.
+
+    The async fan-out in validate_proxies_async  creates bursts of outbound TCP
+    connections to many distinct IPs — exactly the pattern Railway's detector
+    flags.  This serial version checks one proxy, waits 3-6s, checks the next,
+    etc.  It's slow (~5 min for 50 proxies) but guarantees zero connection-pattern
+    risk because there is never more than one in-flight connection at a time.
+    """
+    if not proxies:
+        return []
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        from curl_cffi import AsyncSession
+    total = len(proxies)
+    working: List[str] = []
+    w_lock = asyncio.Lock()
+    timeout = PROXY_VALIDATE_TIMEOUT
+
+    clog(f"{Colors.CYAN}[PROXY-SAFE] validating {total} proxies serially "
+         f"(delay={delay_range[0]}-{delay_range[1]}s, timeout={timeout}s){Colors.RESET}")
+
+    async with AsyncSession() as session:
+        for i, p in enumerate(proxies):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            ok = False
+            try:
+                r = await session.get(
+                    PROXY_VALIDATE_URL,
+                    proxy=p,
+                    timeout=timeout,
+                )
+                ok = r.status_code == 200 and bool(r.text and r.text.strip())
+            except Exception:
+                ok = False
+
+            async with w_lock:
+                if ok:
+                    working.append(p)
+                    if on_success is not None:
+                        try:
+                            on_success(p)
+                        except Exception:
+                            pass
+                if progress_cb is not None:
+                    try:
+                        progress_cb(i + 1, total, len(working))
+                    except Exception:
+                        pass
+
+            # Pause between checks (skip after the last one).
+            if i < total - 1:
+                await asyncio.sleep(random.uniform(*delay_range))
+
+    clog(f"{Colors.CYAN}[PROXY-SAFE] validated {total} proxies, "
+         f"{len(working)} working{Colors.RESET}")
+    return working
+
+
 HITS_FILENAME = "hits_{chat_id}.txt"
 
 
@@ -680,6 +749,9 @@ class CheckJob:
 # Per-chat active jobs so /stop only stops the caller's run.
 active_jobs: dict[int, CheckJob] = {}
 active_jobs_lock = threading.Lock()
+
+# Per-chat active proxy validations (for /stop during /setpr validate).
+active_validations: dict[int, asyncio.Event] = {}
 
 
 def _format_eta(seconds: float) -> str:
@@ -972,65 +1044,80 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
         old_pool = proxy_manager.get_all()
         proxy_manager.clear()
 
-    await status.edit_text(
-        f"Validating {len(candidates)} proxies against `{PROXY_VALIDATE_URL}` ...\n"
-        f"({PROXY_VALIDATE_WORKERS} workers, gentle pacing)\n"
-        f"(proxies are added to the pool as soon as they pass)",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    state = {"done": 0, "working": 0, "last_t": 0.0}
-
-    def on_success(proxy_url: str) -> None:
-        # Stream this proxy into the pool immediately and persist.
-        proxy_manager.add_one(proxy_url)
-
-    def progress(done, total, working):
-        state["done"] = done
-        state["working"] = working
-        now = time.time()
-        if now - state["last_t"] >= STATUS_EDIT_MIN_INTERVAL:
-            state["last_t"] = now
-            _threadsafe_send(_safe_edit_message(
-                context,
-                msg.chat_id,
-                status.message_id,
-                f"Validating proxies ... `{working}` working / `{done}`/`{total}` checked\n"
-                f"Pool size now: {proxy_manager.count()}",
-            ))
-
-    # Run async validation fan-out directly (matches Go's per-goroutine model).
-    await validate_proxies_async(
-        candidates, progress_cb=progress, on_success=on_success,
-    )
-
-    done = state["done"]
-    working_n = state["working"]
-    final_pool = proxy_manager.count()
-
-    if not add and working_n == 0:
-        # Nothing passed -> restore the old pool so we don't leave the user naked.
-        if old_pool:
-            proxy_manager.replace(old_pool)
-            final_pool = proxy_manager.count()
-            text = (
-                f"Validation done. *0* proxies worked out of {len(candidates)}.\n"
-                f"Old pool restored ({final_pool} proxies kept)."
-            )
-        else:
-            text = (
-                f"Validation done. *0* proxies worked out of {len(candidates)}.\n"
-                f"Pool is empty."
-            )
-    else:
-        verb = "added to" if add else "replaced in"
-        text = (
-            f"Validation done.\n"
-            f"Candidates: {len(candidates)}  Checked: {done}\n"
-            f"Working: {working_n}  -> {verb} pool (streamed in real time)\n"
-            f"Pool size now: {final_pool}"
+    # Register a cancel_event so /stop can interrupt validation mid-way.
+    cancel_event = asyncio.Event()
+    if msg.chat_id in active_validations:
+        await status.edit_text("A validation is already running for this chat. Use /stop first.")
+        return
+    active_validations[msg.chat_id] = cancel_event
+    try:
+        await status.edit_text(
+            f"Validating {len(candidates)} proxies *serially* (one at a time, 3-6s delay) ...\n"
+            f"(ultra-safe mode — zero burst risk)\n"
+            f"(use /stop to cancel and keep proxies validated so far)",
+            parse_mode=ParseMode.MARKDOWN,
         )
-    await status.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+
+        state = {"done": 0, "working": 0, "last_t": 0.0}
+
+        def on_success(proxy_url: str) -> None:
+            proxy_manager.add_one(proxy_url)
+
+        def progress(done, total, working):
+            state["done"] = done
+            state["working"] = working
+            now = time.time()
+            if now - state["last_t"] >= STATUS_EDIT_MIN_INTERVAL:
+                state["last_t"] = now
+                _threadsafe_send(_safe_edit_message(
+                    context,
+                    msg.chat_id,
+                    status.message_id,
+                    f"Validating proxies ... `{working}` working / `{done}`/`{total}` checked\n"
+                    f"Pool size now: {proxy_manager.count()}\n"
+                    f"(use /stop to cancel and keep what's validated so far)",
+                ))
+
+        await validate_proxies_serial(
+            candidates, progress_cb=progress, on_success=on_success,
+            cancel_event=cancel_event,
+        )
+
+        was_cancelled = cancel_event.is_set()
+        done = state["done"]
+        working_n = state["working"]
+        final_pool = proxy_manager.count()
+
+        if was_cancelled:
+            text = (
+                f"*Validation stopped by /stop.*\n"
+                f"Working proxies already in pool: {final_pool}\n"
+                f"You can now run /check to use them."
+            )
+        elif not add and working_n == 0:
+            if old_pool:
+                proxy_manager.replace(old_pool)
+                final_pool = proxy_manager.count()
+                text = (
+                    f"Validation done. *0* proxies worked out of {len(candidates)}.\n"
+                    f"Old pool restored ({final_pool} proxies kept)."
+                )
+            else:
+                text = (
+                    f"Validation done. *0* proxies worked out of {len(candidates)}.\n"
+                    f"Pool is empty."
+                )
+        else:
+            verb = "added to" if add else "replaced in"
+            text = (
+                f"Validation done.\n"
+                f"Candidates: {len(candidates)}  Checked: {done}\n"
+                f"Working: {working_n}  -> {verb} pool (streamed in real time)\n"
+                f"Pool size now: {final_pool}"
+            )
+        await status.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    finally:
+        active_validations.pop(msg.chat_id, None)
 
 
 async def cmd_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1483,10 +1570,22 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     clog(f"[cmd] /stop from chat={chat_id} user={update.effective_user}")
+
+    # Check proxy validation first (fast to cancel).
+    cancel_event = active_validations.get(chat_id)
+    if cancel_event is not None and not cancel_event.is_set():
+        cancel_event.set()
+        clog(f"[stop] proxy validation cancelled for chat={chat_id}")
+        await update.message.reply_text(
+            "Proxy validation stopping. Working proxies already in the pool are kept."
+        )
+        return
+
+    # Check account checking (may take a moment to drain in-flight).
     with active_jobs_lock:
         job = active_jobs.get(chat_id)
     if job is None or job.should_stop():
-        await update.message.reply_text("No active check to stop for this chat.")
+        await update.message.reply_text("No active task to stop for this chat.")
         return
     job.stop_event.set()
     await update.message.reply_text("Stop signal sent. In-flight requests will finish, new ones skipped.")
