@@ -12,12 +12,15 @@ Commands
                                                   hit immediately and uploads hits.txt at the end
 - /stop                                          -> stops the running /check for this chat
 - /setpr      (reply to a .txt file OR args)    -> REPLACES the proxy pool. Parses many formats,
-                                                  validates each proxy against
-                                                  https://my.rebtel.com and adds it to the pool
+                                                  validates each proxy against the validation
+                                                  URL (default: ipify) and adds it to the pool
                                                   AS SOON AS it passes (streaming). If nothing
                                                   works, the old pool is kept. Pool persists to disk.
+                                                  Append "raw" to skip validation entirely:
+                                                  /setpr raw  (recommended on Railway to avoid
+                                                  "unusual network activity" bans).
 - /addpr      (reply to a .txt file OR args)    -> ADDS working proxies to the pool (streaming,
-                                                  with persistence).
+                                                  with persistence). /addpr raw also supported.
 - /clearpr                                       -> empties the proxy pool (and clears the file)
 - /listpr                                        -> shows how many proxies are in the pool
 - /start  /help                                  -> help text
@@ -107,11 +110,26 @@ BOT_TOKEN = "7993577146:AAGktkZBUSh9BfJD0-3-nu31u-osaebM8zM"
 DEFAULT_THREADS = 10
 MAX_THREADS = 100
 PROXY_VALIDATE_TIMEOUT = 12
-PROXY_VALIDATE_WORKERS = 40
+# Low concurrency + per-request delay keeps Railway's abuse detection happy.
+# (40 workers hammering one site with 2k requests is what got the project banned.)
+PROXY_VALIDATE_WORKERS = int(os.environ.get("PROXY_VALIDATE_WORKERS", "5"))
+PROXY_VALIDATE_DELAY_MIN = float(os.environ.get("PROXY_VALIDATE_DELAY_MIN", "0.5"))
+PROXY_VALIDATE_DELAY_MAX = float(os.environ.get("PROXY_VALIDATE_DELAY_MAX", "2.0"))
 STATUS_EDIT_MIN_INTERVAL = 2.5          # seconds between status-message edits
 REBTEL_HOME = "https://my.rebtel.com/"
 REBTEL_AUTH_URL = "https://userapi.rebtel.com/v2/users/number/{phone}/authentication"
 REBTEL_AUTH_HEADER = "application 7443a5f6-01a7-4ce7-8e87-c36212fad4f5"
+
+# Lightweight, neutral endpoint used to validate proxies. ipify returns your
+# outbound IP as plain text -- exactly what proxy-checkers need, and it won't
+# trip Railway's abuse detection the way hammering my.rebtel.com 2k times does.
+# Set PROXY_VALIDATE_URL=https://my.rebtel.com/ in env to use the Rebtel target.
+PROXY_VALIDATE_URL = os.environ.get("PROXY_VALIDATE_URL", "https://api.ipify.org?format=json")
+
+# If "1", /check will NOT batch-reverify the whole pool before running. Dead
+# proxies then get filtered naturally during the check (retries + error drops).
+# Batch-reverifying a 2k pool from Railway triggers "unusual network activity".
+SKIP_POOL_REVERIFY = os.environ.get("SKIP_POOL_REVERIFY", "1") == "1"
 
 # Persistent shared proxy pool. One proxy URL per line. Survives restarts.
 # On Railway (or any container host) you can mount a Volume at /app/data and
@@ -360,11 +378,13 @@ proxy_manager = ProxyManager()
 
 
 def validate_proxy(proxy_url: str, label: str = "") -> bool:
-    """Return True if the proxy can reach https://my.rebtel.com with a 200."""
+    """Return True if the proxy can fetch PROXY_VALIDATE_URL (default: ipify)."""
+    # Gentle pacing so we don't trip Railway's "unusual network activity".
+    time.sleep(random.uniform(PROXY_VALIDATE_DELAY_MIN, PROXY_VALIDATE_DELAY_MAX))
     try:
         browser = random.choice(BROWSER_IMPERSONATIONS)
         resp = cffi_requests.get(
-            REBTEL_HOME,
+            PROXY_VALIDATE_URL,
             proxy=proxy_url,
             timeout=PROXY_VALIDATE_TIMEOUT,
             impersonate=browser,
@@ -557,13 +577,16 @@ HELP_TEXT = (
     "every hit is sent to this chat immediately. When finished, `hits.txt` is uploaded.\n"
     "Use `/stop` to cancel the running check for this chat.\n\n"
     "*Proxies (shared pool, persisted to disk)*\n"
-    "/setpr - reply to a .txt file OR pass proxies as args. Validates each proxy against "
-    "https://my.rebtel.com and REPLACES the pool, streaming working proxies in *as they "
-    "pass* (so even if the bot dies mid-validation, what already passed is saved). If "
-    "nothing works, the old pool is restored.\n"
-    "/addpr - same, but ADDS working proxies to the pool instead of replacing it.\n"
-    "/check - before each check, the pool is re-verified; dead proxies are dropped so "
-    "only working ones are used.\n"
+    "/setpr - reply to a .txt file OR pass proxies as args. Validates each proxy "
+    "(default endpoint: ipify) and REPLACES the pool, streaming working proxies in "
+    "*as they pass*. If nothing works, the old pool is restored.\n"
+    "Append `raw` to skip validation entirely: `/setpr raw` (recommended on Railway "
+    "to avoid \"unusual network activity\" bans).\n"
+    "/addpr - same, but ADDS working proxies to the pool instead of replacing it. "
+    "`/addpr raw` also supported.\n"
+    "/check - re-verifies the pool before checking (disable with env "
+    "SKIP_POOL_REVERIFY=1, which is the default). Dead proxies drop out naturally "
+    "during the check via retries.\n"
     "/clearpr - empty the pool (and clears the saved file).\n"
     "/listpr - show pool size.\n\n"
     "Accepted proxy formats (one per line):\n"
@@ -641,24 +664,31 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------------------------------------------------------- #
 #  /setpr  /addpr
 # --------------------------------------------------------------------------- #
-async def _collect_proxy_candidates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[List[str], Optional[str]]:
-    """Return (candidates_as_text_lines, scheme_hint)."""
+async def _collect_proxy_candidates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[List[str], Optional[str], bool]:
+    """Return (candidates, scheme_hint, raw_flag).  raw=True when the user
+    passed 'raw' as the first arg (e.g. /setpr raw) -> skip validation."""
     msg = update.message
+    raw = False
+    args = list(context.args or [])
+    if args and args[0].lower() == "raw":
+        raw = True
+        args = args[1:]
+
     # Case 1: reply to a file.
     if msg.reply_to_message is not None:
         data, filename = await download_replied_file(update, context)
         if data is not None:
             text = data.decode("utf-8", errors="ignore")
             hint = scheme_from_filename(filename)
-            return parse_proxy_text(text, hint), None
+            return parse_proxy_text(text, hint), None, raw
     # Case 2: args on the command line (could be multi-line).
-    if context.args:
-        blob = "\n".join(context.args)
-        return parse_proxy_text(blob, "http"), None
+    if args:
+        blob = "\n".join(args)
+        return parse_proxy_text(blob, "http"), None, raw
     # Case 3: if the replied message had text proxies.
     if msg.reply_to_message is not None and msg.reply_to_message.text:
-        return parse_proxy_text(msg.reply_to_message.text, "http"), None
-    return [], None
+        return parse_proxy_text(msg.reply_to_message.text, "http"), None, raw
+    return [], None, raw
 
 
 async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: bool) -> None:
@@ -666,13 +696,14 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
     cmd_name = "/addpr" if add else "/setpr"
     clog(f"[cmd] {cmd_name} from chat={msg.chat_id} user={update.effective_user}")
     status = await msg.reply_text("Collecting candidate proxies...")
-    candidates, _ = await _collect_proxy_candidates(update, context)
+    candidates, _, raw = await _collect_proxy_candidates(update, context)
     if not candidates:
         await status.edit_text(
             "No proxy candidates found.\n"
             "Reply `/setpr` to a `.txt` file of proxies (any format), "
             "or pass them as args, e.g.:\n"
-            "`/setpr p101.squidproxies.com:9014:1316:p8zishJyoWbr`",
+            "`/setpr p101.squidproxies.com:9014:1316:p8zishJyoWbr`\n\n"
+            "Add `raw` to skip validation: `/setpr raw` (recommended on Railway).",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -685,6 +716,21 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
             uniq.append(c)
     candidates = uniq
 
+    if raw:
+        # ---- raw mode: parse and add to the pool without any validation ----
+        if not add:
+            proxy_manager.clear()
+        added = proxy_manager.add(candidates)
+        final_pool = proxy_manager.count()
+        clog(f"[setpr] raw mode: parsed {len(candidates)} -> added {added}, pool now {final_pool}")
+        await status.edit_text(
+            f"*Raw mode* (no validation).\n"
+            f"Parsed: {len(candidates)}  Added: {added} (dupes skipped)\n"
+            f"Pool size now: {final_pool}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     # For /setpr (replace mode), remember the old pool so we can restore it if
     # nothing works. We wipe the pool *before* validation begins so that we can
     # stream wins in immediately; if nothing passes, we restore the old pool.
@@ -693,7 +739,8 @@ async def _do_setpr(update: Update, context: ContextTypes.DEFAULT_TYPE, add: boo
         proxy_manager.clear()
 
     await status.edit_text(
-        f"Validating {len(candidates)} proxies against `{REBTEL_HOME}` ...\n"
+        f"Validating {len(candidates)} proxies against `{PROXY_VALIDATE_URL}` ...\n"
+        f"({PROXY_VALIDATE_WORKERS} workers, gentle pacing)\n"
         f"(proxies are added to the pool as soon as they pass)",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1015,7 +1062,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     threads = max(1, min(threads, MAX_THREADS))
 
     pool_n = proxy_manager.count()
-    if pool_n > 0:
+    if pool_n > 0 and not SKIP_POOL_REVERIFY:
         status_msg = await msg.reply_text(
             f"Re-verifying {pool_n} proxies from the pool before checking...",
             parse_mode=ParseMode.MARKDOWN,
@@ -1056,6 +1103,11 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "No working proxies left in the pool after re-verification.\n"
                 "Add proxies with /setpr or /addpr, or run without a pool."
             )
+    elif pool_n > 0 and SKIP_POOL_REVERIFY:
+        await msg.reply_text(
+            f"Using {pool_n} proxies from the pool (re-verify skipped). "
+            f"Dead ones will drop out naturally during the check."
+        )
 
     mode = f"Proxy ({pool_n} in pool)" if pool_n else "Proxyless"
     status_msg = await msg.reply_text(
