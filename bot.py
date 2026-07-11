@@ -219,6 +219,12 @@ SOCKS_PORTS = frozenset({
     5555,                   # SOCKS5 (Shadowsocks/R)
 })
 
+# Test phone for Rebtel-based proxy validation in /check pool re-verify.
+# Any properly formatted +1 number works — the point is just to see if the
+# request reaches Rebtel's servers (any HTTP response = working proxy).
+REBTEL_VALIDATE_PHONE = "+15000000000"
+REBTEL_VALIDATE_COUNTRY = "US"
+
 # If "1", /check will NOT batch-reverify the whole pool before running. Dead
 # proxies then get filtered naturally during the check (retries + error drops).
 # Batch-reverifying a 2k pool from Railway triggers "unusual network activity".
@@ -649,6 +655,9 @@ async def validate_proxies_serial(
     on_success=None,
     cancel_event: Optional[asyncio.Event] = None,
     delay_range: Tuple[float, float] = (0.2, 0.5),
+    validate_url: Optional[str] = None,
+    validate_headers: Optional[dict] = None,
+    validate_impersonate: Optional[str] = None,
 ) -> List[str]:
     """Serial proxy validator: one at a time with tiny jitter between checks.
 
@@ -656,6 +665,11 @@ async def validate_proxies_serial(
     connection) — not from large delays.  The small jitter is just to avoid
     looking like a script to trivial observers.  /stop is checked after every
     HTTP response and after every sleep for responsive cancellation.
+
+    When validate_url/validate_headers/validate_impersonate are provided, they
+    are used instead of the default PROXY_VALIDATE_URL.  Any HTTP response (any
+    status code) is considered success — we only care whether the request reached
+    the target server without a transport error.
     """
     if not proxies:
         return []
@@ -667,8 +681,10 @@ async def validate_proxies_serial(
     working: List[str] = []
     w_lock = asyncio.Lock()
     timeout = PROXY_VALIDATE_TIMEOUT
+    url = validate_url or PROXY_VALIDATE_URL
+    label = "rebtel" if validate_url else "httpbin"
 
-    clog(f"{Colors.CYAN}[PROXY-SAFE] validating {total} proxies serially "
+    clog(f"{Colors.CYAN}[PROXY-SAFE] validating {total} proxies serially against {label} "
          f"(delay={delay_range[0]}-{delay_range[1]}s, timeout={timeout}s){Colors.RESET}")
 
     async with AsyncSession() as session:
@@ -679,11 +695,16 @@ async def validate_proxies_serial(
             ok = False
             try:
                 r = await session.get(
-                    PROXY_VALIDATE_URL,
+                    url,
+                    headers=validate_headers,
                     proxy=p,
                     timeout=timeout,
+                    impersonate=validate_impersonate,
                 )
-                ok = r.status_code == 200 and bool(r.text and r.text.strip())
+                # Any HTTP response (even 403/404/500) means the request reached
+                # the target server — proxy is working. Only transport errors
+                # (timeout, DNS fail, connection refused) count as dead.
+                ok = True
             except Exception:
                 ok = False
 
@@ -713,7 +734,7 @@ async def validate_proxies_serial(
                     clog(f"{Colors.YELLOW}[PROXY-SAFE] cancelled after sleep (proxy {i+1}/{total}){Colors.RESET}")
                     break
 
-    clog(f"{Colors.CYAN}[PROXY-SAFE] validated {total} proxies, "
+    clog(f"{Colors.CYAN}[PROXY-SAFE] validated {total} proxies against {label}, "
          f"{len(working)} working{Colors.RESET}")
     return working
 
@@ -1472,6 +1493,11 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"(use /stop to cancel and keep what's verified so far)",
                 ))
 
+        # Re-verify against Rebtel so only proxies that actually reach Rebtel
+        # (not just any public HTTP endpoint) survive into the pool.
+        rebtel_url = f"{REBTEL_NORMALIZE_URL}?number={REBTEL_VALIDATE_PHONE}&countryId={REBTEL_VALIDATE_COUNTRY}"
+        rebtel_headers = _make_check_headers()
+
         current_pool = proxy_manager.get_all()
         cancel_event = asyncio.Event()
         active_validations[chat_id] = cancel_event
@@ -1479,6 +1505,9 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             working_after = await validate_proxies_serial(
                 current_pool, progress_cb=rv_progress,
                 cancel_event=cancel_event,
+                validate_url=rebtel_url,
+                validate_headers=rebtel_headers,
+                validate_impersonate=CHECK_IMPERSONATE,
             )
         finally:
             active_validations.pop(chat_id, None)
