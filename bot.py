@@ -55,6 +55,7 @@ from typing import List, Optional, Tuple
 
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
+from telegram.error import Conflict as TelegramConflict
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -207,6 +208,17 @@ def detect_country_id(phone: str) -> str:
                 return CC_TO_COUNTRY_ID[cc]
     return "US"
 
+# Common SOCKS ports for auto-detection when no explicit scheme is given.
+# If a proxy's port is in this set and scheme_hint is "http", override to "socks5".
+SOCKS_PORTS = frozenset({
+    1080, 1081, 10808,     # SOCKS5 common
+    4145,                   # SOCKS4 default
+    9050, 9051,             # Tor SOCKS
+    1092, 1337, 8123,       # common SOCKS5 alternative
+    10800,                  # V2Ray SOCKS
+    5555,                   # SOCKS5 (Shadowsocks/R)
+})
+
 # If "1", /check will NOT batch-reverify the whole pool before running. Dead
 # proxies then get filtered naturally during the check (retries + error drops).
 # Batch-reverifying a 2k pool from Railway triggers "unusual network activity".
@@ -313,8 +325,21 @@ def clean_lines(lines: List[str]) -> Tuple[List[str], int, int]:
 # --------------------------------------------------------------------------- #
 #  Proxy parsing
 # --------------------------------------------------------------------------- #
+def _detect_scheme(port_str: str, hint: str) -> str:
+    """Override scheme_hint to socks5 if port is a known SOCKS port."""
+    if hint != "http":
+        return hint
+    if port_str.isdigit() and int(port_str) in SOCKS_PORTS:
+        return "socks5"
+    return hint
+
+
 def normalize_proxy(raw: str, scheme_hint: str = "http") -> Optional[str]:
-    """Return a proxy URL ready for curl_cffi, or None if unparseable."""
+    """Return a proxy URL ready for curl_cffi, or None if unparseable.
+
+    When scheme_hint is \"http\" (the default), common SOCKS ports are
+    auto-detected and overridden to \"socks5\".
+    """
     raw = raw.strip()
     if not raw:
         return None
@@ -324,16 +349,23 @@ def normalize_proxy(raw: str, scheme_hint: str = "http") -> Optional[str]:
         return raw
     # user:pass@host:port
     if "@" in raw:
-        return f"{scheme_hint}://{raw}"
+        _, hostpart = raw.split("@", 1)
+        if ":" in hostpart:
+            port = hostpart.rsplit(":", 1)[-1]
+            hint = _detect_scheme(port, scheme_hint)
+        else:
+            hint = scheme_hint
+        return f"{hint}://{raw}"
     parts = raw.split(":")
     if len(parts) == 2:
         host, port = parts
-        return f"{scheme_hint}://{host}:{port}"
+        hint = _detect_scheme(port, scheme_hint)
+        return f"{hint}://{host}:{port}"
     if len(parts) == 4:
         host, port, user, pw = parts
-        return f"{scheme_hint}://{user}:{pw}@{host}:{port}"
+        hint = _detect_scheme(port, scheme_hint)
+        return f"{hint}://{user}:{pw}@{host}:{port}"
     if len(parts) == 3:
-        # ambiguous - treat first as host, second as port, third as user with empty password? skip.
         return None
     return None
 
@@ -1470,8 +1502,18 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # --------------------------------------------------------------------------- #
 #  Main
 # --------------------------------------------------------------------------- #
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Silence known spurious errors so they don't fill logs."""
+    exc = context.error
+    if isinstance(exc, TelegramConflict):
+        clog(f"{Colors.YELLOW}[warn] Telegram Conflict (duplicate bot instance){Colors.RESET}")
+        return
+    clog(f"{Colors.RED}[err] Unhandled exception: {exc}{Colors.RESET}")
+
+
 def build_app() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clean", cmd_clean))
@@ -1492,7 +1534,7 @@ def main() -> None:
     clog(f"{Colors.BOLD}{Colors.CYAN}Rebtel Telegram bot starting...{Colors.RESET}")
     clog(f"{Colors.CYAN}Loaded {n} proxies from {PROXY_POOL_FILE}{Colors.RESET}")
     clog(f"{Colors.CYAN}Token: {BOT_TOKEN[:12]}...{Colors.RESET}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
